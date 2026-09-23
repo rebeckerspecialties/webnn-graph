@@ -390,14 +390,18 @@ fn infer_shape(
                         shape_tensor
                             .raw_data
                             .as_slice()
-                            .chunks_exact(4)
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
                             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64)
                             .collect()
                     } else {
                         shape_tensor
                             .raw_data
                             .as_slice()
-                            .chunks_exact(8)
+                            .as_chunks::<8>()
+                            .0
+                            .iter()
                             .map(|c| {
                                 i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])
                             })
@@ -702,7 +706,9 @@ fn infer_shape(
                         if !raw.is_empty() {
                             if t.data_type == TensorProto_DataType::Int32 as i32 {
                                 return Some(
-                                    raw.chunks_exact(4)
+                                    raw.as_chunks::<4>()
+                                        .0
+                                        .iter()
                                         .map(|c| {
                                             i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64
                                         })
@@ -710,7 +716,9 @@ fn infer_shape(
                                 );
                             } else {
                                 return Some(
-                                    raw.chunks_exact(8)
+                                    raw.as_chunks::<8>()
+                                        .0
+                                        .iter()
                                         .map(|c| {
                                             i64::from_le_bytes([
                                                 c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7],
@@ -1850,11 +1858,15 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                 let raw = initializer.raw_data.as_slice();
                 let values = if !raw.is_empty() {
                     if initializer.data_type == TensorProto_DataType::Int32 as i32 {
-                        raw.chunks_exact(4)
+                        raw.as_chunks::<4>()
+                            .0
+                            .iter()
                             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64)
                             .collect()
                     } else {
-                        raw.chunks_exact(8)
+                        raw.as_chunks::<8>()
+                            .0
+                            .iter()
                             .map(|c| {
                                 i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])
                             })
@@ -1894,11 +1906,15 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                         let raw = tensor.raw_data.as_slice();
                         let values = if !raw.is_empty() {
                             if tensor.data_type == TensorProto_DataType::Int32 as i32 {
-                                raw.chunks_exact(4)
+                                raw.as_chunks::<4>()
+                                    .0
+                                    .iter()
                                     .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64)
                                     .collect()
                             } else {
-                                raw.chunks_exact(8)
+                                raw.as_chunks::<8>()
+                                    .0
+                                    .iter()
                                     .map(|c| {
                                         i64::from_le_bytes([
                                             c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7],

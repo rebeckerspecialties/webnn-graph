@@ -1,288 +1,105 @@
-# WebNN Graph Examples
+# Examples
 
-This directory contains a complete working example demonstrating the full workflow of the WebNN graph DSL.
+The checked-in examples demonstrate the `.webnn` DSL, raw-weight utilities, JavaScript emitter, and interactive
+HTML emitter.
 
-## Contents
+For format details, see:
 
-- **resnet_head.webnn** - Graph definition (data-agnostic template)
-- **weights.manifest.json** - Original manifest (for reference)
-- **tensors/** - Example tensor files (W.bin, b.bin with metadata)
-- **build_example.sh** - Automated build script
-- **browser_example.html** - Interactive browser demo
+- [WebNN graph format](../docs/webnn-format.md)
+- [External weight format](../docs/external-weights.md)
 
-## Generated Files (after running build script)
+## Files
 
-- **resnet_head.manifest.json** - Generated weights manifest
-- **resnet_head.weights** - Binary weights file (7.8 MB)
-- **buildGraph.js** - Generated JavaScript with WeightsFile helper
+- `format_reference.webnn` exercises the maintained v2 grammar and is covered by a round-trip test.
+- `resnet_head.webnn` is a small graph whose constants use external references.
+- `tensors/` contains tensor metadata. The build script reconstructs untracked raw `.bin` inputs from the
+  checked-in reference archive.
+- `build_example.sh` creates a manifest, packs a `WGWT` weights file, and emits JavaScript.
+- `browser_example.html` is an example host for emitted WebNN builder code.
 
-## Quick Start
+Some generated artifacts are checked in for inspection. Rerun the script before relying on them after changing
+the graph, manifest, tensors, or emitter.
 
-### 1. Build the Example
+## Parse, serialize, and validate
 
-Run the automated build script:
+```bash
+cargo run -- parse examples/format_reference.webnn > /tmp/format_reference.json
+cargo run -- serialize /tmp/format_reference.json > /tmp/format_reference.webnn
+cargo run -- validate /tmp/format_reference.webnn
+```
+
+The format-reference graph declares an external tensor for syntax coverage. Parsing and structural validation do
+not resolve that sidecar.
+
+## Raw-weight workflow
+
+Run the complete ResNet-head example from the repository root:
 
 ```bash
 ./examples/build_example.sh
 ```
 
-This will:
-1. Create a manifest from the tensor files
-2. Pack the tensors into a binary `.weights` file
-3. Generate the JavaScript module
-
-### 2. Run in Browser
-
-Serve the examples directory with a web server:
+It performs the equivalent steps:
 
 ```bash
-# Using Python
-python3 -m http.server 8000
-
-# Or using Node.js
-npx http-server -p 8000
-```
-
-Then open http://localhost:8000/browser_example.html
-
-### 3. Manual Workflow
-
-You can also run each step manually:
-
-```bash
-# Step 1: Create manifest from tensors
 cargo run -- create-manifest \
   --input-dir examples/tensors \
-  --output examples/my_manifest.json \
+  --output examples/resnet_head.manifest.json \
   --endianness little
 
-# Step 2: Pack weights into binary
 cargo run -- pack-weights \
-  --manifest examples/my_manifest.json \
+  --manifest examples/resnet_head.manifest.json \
   --input-dir examples/tensors \
-  --output examples/my_model.weights
+  --output examples/resnet_head.weights
 
-# Step 3: Generate JavaScript
-cargo run -- parse examples/resnet_head.webnn | \
-  cargo run -- emit-js /dev/stdin > examples/my_graph.js
+cargo run -- validate examples/resnet_head.webnn \
+  --weights-manifest examples/resnet_head.manifest.json
 
-# Optional: Unpack weights for inspection
-cargo run -- unpack-weights \
-  --weights examples/my_model.weights \
-  --manifest examples/my_manifest.json \
-  --output-dir examples/unpacked/
+cargo run -- emit-js examples/resnet_head.webnn > examples/buildGraph.js
 ```
 
-## Understanding the Example
+The packed file begins with the `WGWT` version-1 header. Manifest byte offsets are absolute from the beginning
+of that file, including its eight-byte header.
 
-### Graph Definition (resnet_head.webnn)
-
-The `.webnn` file defines only the **structure** - no actual data:
-
-```webnn
-webnn_graph "resnet_head" v1 {
-  inputs {
-    x: f32[1, 2048];  // Shape only!
-  }
-  consts {
-    W: f32[2048, 1000] @weights("W");  // External reference
-    b: f32[1000]       @weights("b");
-  }
-  nodes {
-    logits0 = matmul(x, W);
-    logits  = add(logits0, b);
-    probs   = softmax(logits, axis=1);
-  }
-  outputs { probs; }
-}
-```
-
-### Tensor Files (tensors/ directory)
-
-Each weight has:
-- **W.bin** - Raw binary data (float32 values)
-- **W.meta.json** - Metadata (shape, dataType, layout)
-
-### Generated JavaScript
-
-The `buildGraph.js` contains:
-
-1. **WeightsFile class** - Loads and validates weights
-   ```javascript
-   const weights = await WeightsFile.load('model.weights', 'manifest.json');
-   ```
-
-2. **buildGraph function** - Constructs the WebNN graph
-   ```javascript
-   const graph = await buildGraph(context, weights);
-   ```
-
-### Runtime Usage
-
-The key benefit: **graph reusability**
-
-```javascript
-// One-time setup
-const weights = await WeightsFile.load('resnet_head.weights', 'manifest.json');
-const context = await navigator.ml.createContext();
-const graph = await buildGraph(context, weights);
-
-// Run multiple times with different inputs
-const result1 = await context.compute(graph, { x: input1 });
-const result2 = await context.compute(graph, { x: input2 });
-const result3 = await context.compute(graph, { x: input3 });
-// ... no rebuilding needed!
-```
-
-## File Formats
-
-### Weights Binary Format (.weights)
-
-```
-┌─────────────────────────────────────┐
-│ Magic: "WGWT" (4 bytes)            │
-├─────────────────────────────────────┤
-│ Version: 1 (4 bytes, little-endian)│
-├─────────────────────────────────────┤
-│ W tensor data (8,192,000 bytes)    │
-│ b tensor data (4,000 bytes)        │
-└─────────────────────────────────────┘
-```
-
-### Weights Manifest (.manifest.json)
-
-Describes where each tensor lives in the binary file:
-
-```json
-{
-  "format": "wg-weights-manifest",
-  "version": 1,
-  "endianness": "little",
-  "tensors": {
-    "W": {
-      "dataType": "float32",
-      "shape": [2048, 1000],
-      "byteOffset": 8,
-      "byteLength": 8192000
-    },
-    "b": { ... }
-  }
-}
-```
-
-## Creating Your Own Tensors
-
-To add your own weights:
-
-1. Create binary files (e.g., using Python/NumPy):
-   ```python
-   import numpy as np
-
-   # Create tensor
-   W = np.random.randn(2048, 1000).astype(np.float32)
-   W.tofile('W.bin')
-
-   # Create metadata
-   import json
-   with open('W.meta.json', 'w') as f:
-       json.dump({
-           "dataType": "float32",
-           "shape": [2048, 1000],
-           "byteOffset": 8,  # After header
-           "byteLength": W.nbytes,
-           "layout": "row-major"
-       }, f)
-   ```
-
-2. Run the build workflow to pack and generate code
-
-## Troubleshooting
-
-**"WebNN API not supported"**
-- Use a browser with WebNN support (Chrome/Edge with experimental features enabled)
-- Visit `chrome://flags` and enable "Experimental Web Platform features"
-
-**"Failed to load weights"**
-- Make sure you're serving the files via HTTP (not file://)
-- Check that all generated files exist in the examples directory
-
-**"Invalid magic bytes"**
-- Re-run `build_example.sh` to regenerate the weights file
-- Ensure the manifest matches the weights file
-
-## ONNX Conversion Workflow
-
-If you have an existing ONNX model, you can convert it to WebNN format. This is especially useful for transformer models like BERT.
-
-### Built-in Constant Folding
-
-The converter includes built-in constant folding (enabled with `--optimize`) that automatically handles dynamic shape patterns. No external preprocessing needed!
-
-### Step-by-Step Example
+Inspect the archive by unpacking it into a temporary directory:
 
 ```bash
-# Step 1: Convert ONNX to WebNN with constant folding
-cargo run -- convert-onnx --input your-model.onnx --optimize \
+cargo run -- unpack-weights \
+  --weights examples/resnet_head.weights \
+  --manifest examples/resnet_head.manifest.json \
+  --output-dir /tmp/resnet_head_tensors
+```
+
+## JavaScript and HTML output
+
+Generate WebNN builder JavaScript:
+
+```bash
+cargo run -- emit-js examples/resnet_head.webnn > /tmp/build_graph.js
+```
+
+Generate a standalone graph visualization:
+
+```bash
+cargo run -- emit-html examples/resnet_head.webnn > /tmp/resnet_head.html
+```
+
+Executing the generated builder requires a JavaScript environment that implements the WebNN APIs used by the
+graph. The emitters do not provide a WebNN runtime.
+
+## ONNX conversion
+
+ONNX conversion is available with the default `onnx` feature:
+
+```bash
+cargo run -- convert-onnx \
+  --input model.onnx \
+  --output model.webnn \
+  --weights model.weights \
+  --manifest model.manifest.json \
   --override-dim batch_size=1 \
-  --override-dim sequence_length=128
-
-# This creates three files:
-# - your-model.webnn (graph structure)
-# - your-model.weights (binary weights)
-# - your-model.manifest.json (weights metadata)
-
-# Step 2: Generate JavaScript
-cargo run -- emit-js your-model.webnn > your-model.js
-
-# Step 3: Create an interactive visualizer
-cargo run -- emit-html your-model.webnn > visualizer.html
-open visualizer.html
+  --optimize
 ```
 
-### How Constant Folding Works
-
-WebNN doesn't support dynamic shapes. ONNX models (especially transformers) often use patterns like:
-
-```
-Shape → Gather → Concat → Reshape
-```
-
-The `--optimize` flag automatically evaluates these patterns at conversion time:
-
-- ✅ Before: `Shape` operation computes dimensions dynamically
-- ✅ After: Reshape uses constant `[1, 128, 768]` directly
-
-**Results for BERT models with `--optimize`:**
-- Original: ~637 nodes with Shape operations
-- After constant folding: ~317 nodes (50% reduction)
-- All reshape operations use static constants
-
-**See also:** [Dynamic Dimensions Guide](../docs/dynamic-dimensions-guide.md) for help choosing dimension override values.
-
-### Using the Converted Model
-
-The converted WebNN model can be used just like the manual examples:
-
-```javascript
-// Load the converted model
-const weights = await WeightsFile.load('your-model.weights',
-                                        'your-model.manifest.json');
-const context = await navigator.ml.createContext();
-const graph = await buildGraph(context, weights);
-
-// Run inference with your input data
-const inputIds = new Int32Array([101, 2023, 2003, ...]);
-const attentionMask = new Int32Array([1, 1, 1, ...]);
-
-const result = await context.compute(graph, {
-  input_ids: inputIds,
-  attention_mask: attentionMask
-});
-```
-
-## Next Steps
-
-- Modify `resnet_head.webnn` to define your own graph
-- Replace tensors with your trained model weights
-- Convert existing ONNX models using the workflow above
-- Use the generated JavaScript in your web application
+See [ONNX to WebNN lowering](../docs/onnx-lowering.md) and
+[Dynamic dimensions](../docs/dynamic-dimensions-guide.md) for current conversion behavior.

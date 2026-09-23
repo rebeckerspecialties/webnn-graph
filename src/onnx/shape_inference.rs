@@ -358,11 +358,7 @@ fn infer_node_shape(node: &NodeProto, ctx: &InferenceResult) -> Option<Vec<i64>>
         "Concat" => {
             let mut shapes = Vec::new();
             for inp in node.input.as_slice() {
-                if let Some(s) = ctx.value_shapes.get(inp.as_str()) {
-                    shapes.push(s.clone());
-                } else {
-                    return None;
-                }
+                shapes.push(ctx.value_shapes.get(inp.as_str())?.clone());
             }
             if shapes.is_empty() {
                 return None;
@@ -1379,11 +1375,15 @@ fn read_int_tensor(tensor: &TensorProto) -> Vec<i64> {
     if !raw.is_empty() {
         match tensor.data_type {
             x if x == TensorProto_DataType::Int32 as i32 => raw
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64)
                 .collect(),
             _ => raw
-                .chunks_exact(8)
+                .as_chunks::<8>()
+                .0
+                .iter()
                 .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
                 .collect(),
         }

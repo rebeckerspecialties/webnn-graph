@@ -12,7 +12,7 @@ env:
 
 jobs:
   test:
-    name: Test (${{ matrix.os }}, minimal=${{ matrix.minimal }})
+    name: MSRV (${{ matrix.os }}, minimal=${{ matrix.minimal }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -27,7 +27,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: rustfmt, clippy
 
@@ -72,6 +72,62 @@ jobs:
       # Cache the ResNet-50 ONNX model separately so it survives Cargo.lock churn
       # and is not evicted as collateral damage when the target/ cache is invalidated.
       # Static key — bump the suffix only if the upstream model URL changes.
+      - name: Cache ResNet-50 ONNX model
+        uses: actions/cache@v4
+        with:
+          path: target/test-data
+          key: resnet50-onnx-opset16-v1
+
+      - name: Check formatting
+        run: make fmt-check
+
+      - name: Run clippy
+        run: make lint
+
+      - name: Run tests
+        run: make test
+
+      - name: Build release
+        run: make release
+
+  stable:
+    name: Current stable
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ubuntu-stable-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ubuntu-stable-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ubuntu-stable-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ubuntu-stable-cargo-git-
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ubuntu-stable-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ubuntu-stable-target-
+
       - name: Cache ResNet-50 ONNX model
         uses: actions/cache@v4
         with:

@@ -2,6 +2,7 @@
 name = "webnn-graph"
 version = "0.3.0"
 edition = "2021"
+rust-version = "1.97"
 license = "Apache-2.0"
 description = "Simple DSL for WebNN graphs"
 

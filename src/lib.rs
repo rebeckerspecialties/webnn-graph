@@ -1,7 +1,10 @@
 pub mod ast;
 pub mod debug;
 pub mod external_weights;
-pub use external_weights::{resolve_external_weights, WeightResolveError};
+pub use external_weights::{
+    resolve_external_weights, write_external_weights_safetensors, WeightResolveError,
+    WeightWriteError, PACKED_4BIT_METADATA_KEY, PACKED_4BIT_METADATA_VERSION,
+};
 
 pub mod emit_html;
 pub mod emit_js;

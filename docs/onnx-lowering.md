@@ -1,215 +1,88 @@
-# Reference: ONNX → WebNN Lowering
+# ONNX to WebNN lowering
 
-This reference explains how `webnn-graph` lowers ONNX graphs into the WebNN DSL.
+The optional `onnx` feature converts ONNX models into the `GraphJson` AST and serializes them as `.webnn` or
+JSON. The converter accepts `ai.onnx` opsets 11 through 18. Other domains are retained for operator-specific
+handling rather than being checked by the `ai.onnx` opset guard.
 
-## Key concepts up front
-- **Shape inference**: collect and propagate concrete shapes for every value. Inputs and initializers seed
-  known shapes; integer constants feed shape math; ops like `MatMul`, `Transpose`, `Concat`, `Reduce*`,
-  `Gather`, `Reshape` (with known newShape), etc., derive output shapes. Some unresolved symbolic input
-  metadata may still be preserved in v2 graphs, but shape-critical paths must be static.
-- **Const folding boundaries**: only small integer tensors used for shape/axes/newShape/starts/ends math are
-  folded. Real weight tensors are never folded—they stay as external weights or inline bytes for tiny
-  scalars. This keeps semantic fidelity while unlocking static shapes.
-- **Serialization**: the `.webnn` output stores only structure (inputs, const declarations, nodes, outputs).
-  Actual tensor bytes live in `model.weights` with offsets/types in `model.manifest.json`. Inline bytes are
-  allowed for tiny scalars; everything else is referenced via `@weights("key")`.
+## Conversion flow
 
-## Why simplification is mandatory
-- **WebNN is static**: execution-relevant tensor shapes must be known at build time.
-- **ONNX can be dynamic**: inputs often carry symbolic dims (e.g., `batch`, `seq_len`), and graphs may
-  manipulate shapes at runtime (`Shape → Gather → Concat → Reshape` pipelines, dynamic `Slice`, etc.).
-- **Goal**: arrive at a graph where every tensor shape is concrete and every shape-producing expression is
-  either folded to a constant or rejected early with a clear error, while preserving input-dim metadata
-  when possible.
+1. Read and decode the ONNX protobuf.
+2. Optionally run registered constant-folding evaluators with `--optimize`.
+3. Collect explicit, sidecar, and model-metadata dimension overrides.
+4. Convert graph inputs and initializers into WebNN inputs and constants.
+5. Infer intermediate types and shapes required by each supported lowering.
+6. Lower each ONNX node through the operator registry.
+7. Optionally extract constants to `.weights` plus `.manifest.json`.
+8. Serialize the resulting `GraphJson` as `.webnn` or JSON.
 
+Unsupported opsets, operators, dtypes, attributes, or unresolved shape-critical values fail conversion with an
+error. The converter does not silently omit a node.
 
-## Two-phase lowering
-1) **Prepare the ONNX graph for static lowering**
-   - **Provide overrides when needed**: use `--override-dim name=value` to pin symbolic dims (e.g.,
-     `batch=1`, `seq_len=128`). A sidecar `*.dims.json` can supply the same. Defaults may kick in for
-     common names (`batch`, `sequence_length`, etc.) when missing.
-   - **Enable constant folding**: use the `--optimize` flag to activate built-in constant folding that
-     eliminates dynamic-shape plumbing such as:
-     - `Shape` → `Gather` → `Concat` → `Reshape`
-     - Constant axes/starts/ends passed around as tensors
-   - **Result**: shape expressions required by WebNN become static; unresolved symbolic input dims can be
-  preserved as metadata in v2 graphs when `--experimental-dynamic-inputs` is enabled.
+## Dimensions and shape expressions
 
-2) **Lower the ONNX graph to WebNN DSL**
-   - **Opset guard**: only `ai.onnx` opset 11–18 is accepted.
-   - **Shape/type seeding**: inputs (minus initializers) become WebNN inputs; shapes can include dynamic
-     metadata for unresolved symbolic dims;
-     initializers become constants; integer constants are recorded for later shape math.
-   - **Static shape inference**: a conservative pass infers shapes for intermediates and folds small integer
-     tensors needed for axes/newShape/starts/ends. If unresolved dynamics block required inference, node
-     conversion fails with a targeted error.
-   - **Constant folding** (`--optimize`): evaluates Shape/Gather/Concat/Cast/Squeeze/Unsqueeze operations
-     at conversion time, replacing them with their computed constant values. Reduces graph size by 40-50%
-     for transformer models.
-   - **Node conversion**: each ONNX node is mapped to one or more WebNN ops via `OpRegistry`; purely
-     constant outputs are emitted as consts and skipped as nodes.
-   - **Serialization**: emit `.webnn` (structure only) plus `.weights` and `.manifest.json` (raw bytes +
-     offsets). Inline bytes are used only for tiny scalars; real tensors use `@weights("key")`.
+Static overrides specialize symbolic ONNX inputs. Experimental bounded dynamic input metadata can preserve an
+unresolved input dimension when downstream lowering can still determine every required operation argument.
 
-### Flow at a glance
-```mermaid
-flowchart LR
-    A["ONNX model (may have symbolic dims)"]
-    B["Shape overrides (--override-dim) + constant folding (--optimize)"]
-    C["Static shape inference"]
-    D["Constant folding: Shape/Gather/Concat/etc"]
-    E["Op mapping (OpRegistry)"]
-    F["WebNN DSL (.webnn)"]
-    G["Weights sidecars (.weights + .manifest.json)"]
+See [Dynamic dimensions](dynamic-dimensions-guide.md) for override precedence, `.dims.json`, metadata, inferred
+batch defaults, and the `dyn(...)` representation.
 
-    A --> B --> C --> D --> E --> F
-    D --> G
+ONNX graphs often calculate operation arguments through small tensor subgraphs. With `--optimize`, registered
+evaluators fold expressions whose inputs are known constants before lowering. Without a foldable value, an
+operation that requires a static reshape target, axis, permutation, slice bound, or similar parameter is rejected.
+
+The exact supported behavior is operator- and opset-specific. Source tests are authoritative; this page does not
+claim that every variant of a named ONNX operator is supported.
+
+## Constants and output artifacts
+
+By default, `convert-onnx` extracts initializers and large inline constants into a headerless `.weights` blob and
+a manifest whose offsets start at zero. Constants larger than 1 KiB are moved out of the graph when extraction is
+enabled. Smaller scalar and byte constants may remain inline.
+
+```bash
+webnn-graph convert-onnx \
+  --input model.onnx \
+  --output model.webnn \
+  --weights model.weights \
+  --manifest model.manifest.json \
+  --override-dim batch_size=1 \
+  --optimize
 ```
 
+Omitting explicit output paths derives all three names from the ONNX filename. `--inline-weights` suppresses the
+raw sidecars and retains constants in the graph representation.
 
-## How dynamic constructs are handled
-- **Symbolic input dims**: may be preserved in v2 input metadata when unresolved if
-  `--experimental-dynamic-inputs` is enabled, but conversion still requires concrete values wherever
-  shape math must be static.
-- **Shape-producing ops** (`Shape`, `Gather`, `Concat`, `Unsqueeze`, `Squeeze`, `Cast` of ints):
-  - If the inputs are compile-time constants, the converter folds them and records both the values and
-    shapes.
-  - If not foldable, the op is left as a WebNN `shape`/`gather`/`concat`/`unsqueeze`/`squeeze` node, but
-    only when its shape impact is already known and compatible with WebNN.
-- **Reshape**:
-  - Requires `newShape` to be fully known. The converter pulls it from constant tensors or folded const
-    values; `-1` is resolved using the input element count.
-  - If `newShape` is not fully static, conversion fails with a clear “WebNN requires static newShape” error.
-- **Slice**:
-  - Starts/ends/axes/steps must be constants. Steps other than 1 are rejected. Negative indices are
-    normalized using known input dims. Unknown dims lead to a failure.
-- **Gather**:
-  - Axis is normalized; if both data and indices are constant, it is folded. Otherwise, shape inference
-    ensures the output shape is determined.
-- **Transpose/Concat/Split/Unsqueeze/Squeeze**:
-  - Permutations/axes must be known. Concat requires all input shapes known; otherwise, conversion stops.
-- **Constant folding scope**:
-  - Only small integer tensors used for shape math are folded. Real weight tensors are never folded; they
-    are carried through to the weights file.
+The ONNX converter currently emits manifest-backed raw weights, not SafeTensors. Consumers may subsequently save
+the graph through a writer that produces `.webnn` plus `.safetensors`.
 
-### Before/after examples for common tricky patterns
-- **Dynamic reshape pipeline**  
-  - Original ONNX: `X -> Shape -> Gather -> Concat -> Reshape(X, newShape=tensor)` with symbolic dims.  
-  - With `--optimize`: `newShape` becomes a constant tensor (e.g., `[1,128,12,32]`); `Shape/Gather/Concat`
-    are removed.  
-  - After WebNN lowering: a single `reshape(X, newShape=[1,128,12,32])` node; `newShape` is static and
-    embedded as an inline small const if needed.
-  ```mermaid
-  flowchart LR
-    A[X] --> B[Shape]
-    B --> C[Gather]
-    C --> D[Concat]
-    D --> E["Reshape X,newShape=tensor"]
-    subgraph constant_folding
-      F[X] --> G["Reshape X,newShape=[1,128,12,32]"]
-    end
-    subgraph webnn
-      H["reshape(X,[1,128,12,32])"]
-    end
-  ```
-- **Slice with computed bounds**  
-  - Original ONNX: `starts`/`ends`/`axes`/`steps` produced by small subgraphs.  
-  - With `--optimize`: those tensors become constants with normalized axes; negative indices are resolved.  
-  - After WebNN lowering: one `slice` node with static starts/ends/axes/steps; rejected if any bound stays
-    dynamic or `step != 1`.
-  ```mermaid
-  flowchart LR
-    A[starts subgraph] --> B[Slice]
-    C[ends subgraph] --> B
-    D[axes subgraph] --> B
-    E[steps subgraph] --> B
-    subgraph constant_folding
-      F[starts const] --> G["Slice(static)"]
-      H[ends const] --> G
-      I[axes const] --> G
-      J[steps const] --> G
-    end
-    subgraph webnn
-      K[slice static bounds]
-    end
-  ```
-- **Axis/permute tensors**  
-  - Original ONNX: axes for `Unsqueeze`/`Squeeze`/`Reduce*` or perm for `Transpose` are fed by tensors.  
-  - With `--optimize`: axes/perm are folded into constant tensors.  
-  - After WebNN lowering: ops carry inline static `axes` or `permutation` arrays; if still dynamic, the op
-    is rejected.
-  ```mermaid
-  flowchart LR
-    A[axes tensor] --> B[Unsqueeze]
-    subgraph constant_folding
-      C[axes const] --> D["Unsqueeze axes=[1,3]"]
-    end
-    subgraph webnn
-      E["unsqueeze axes=[1,3]"]
-    end
-  ```
-- **Gather for shape math**  
-  - Original ONNX: `Gather(Shape(X), idx)` to pick a dim.  
-  - With `--optimize`: `Shape` and `Gather` are removed and replaced by a scalar constant (e.g., sequence
-    length).  
-  - After WebNN lowering: the scalar becomes an inline const; no `gather` node is emitted.
-  ```mermaid
-  flowchart LR
-    A[X] --> B[Shape]
-    B --> C[Gather idx]
-    subgraph constant_folding
-      D[const dim]:::const
-    end
-    subgraph webnn
-      E[inline scalar const]:::const
-    end
-    classDef const fill:#eef,stroke:#66f;
-  ```
-- **Broadcasted elementwise ops**  
-  - Original ONNX: elementwise ops rely on runtime broadcasting.  
-  - With `--optimize`: shapes are static and compatible; broadcasting stays implicit.  
-  - After WebNN lowering: elementwise ops are emitted as-is; shapes are already known, so no extra shape
-    ops are needed.
-  ```mermaid
-  flowchart LR
-    A["X (static shape)"] --> C[Add]
-    B["Y (static shape)"] --> C
-    subgraph webnn
-      D["add(X,Y) with inferred broadcast"]
-    end
-  ```
+See [External weight format](external-weights.md) for both raw and SafeTensors contracts.
 
- 
+## Graph versions
 
-## Operator mapping (ONNX → WebNN)
-- **MatMul/Gemm**: `matmul` (plus optional transposes, alpha/beta scaling, and bias add for Gemm).
-  Transposes are emitted as separate `transpose` nodes when requested.
-- **Elementwise**: `Add`, `Sub`, `Mul`, `Div`, `Pow` map directly to WebNN elementwise ops with
-  broadcasted shapes already inferred.
-- **Activations**: `Relu`, `Gelu`, `Tanh`, `Sigmoid`, `Sqrt`, `Exp`, `Log`, `Abs`, `Neg`, `Erf` map
-  one-to-one.
-- **Normalization**: `LayerNormalization` (with epsilon/axes) and `Softmax` (axis).
-- **Reshape family**: `Reshape`, `Transpose`, `Concat`, `Split`, `Unsqueeze`, `Squeeze` with static
-  axes/newShape/permutation; failures if not static.
-- **Utility**: `Shape`, `Gather`, `Slice` as described above; `Cast` with supported dtype mapping.
-- **Reductions**: `ReduceMean`, `ReduceSum`, `ReduceMax`, `ReduceMin` with `axes` and `keepdims`.
+The converter emits graph version 2 when at least one input retains a bounded dynamic dimension; otherwise it
+emits version 1. Both versions use the same nodes, constants, and output structures.
 
-Unsupported ops (or ops with remaining dynamism) fail fast with an explicit “unsupported operator” or
-“WebNN requires static …” message to keep the pipeline predictable.
+The `@quantized` graph flag is metadata carried by `GraphJson` and serialization. It does not select a different
+ONNX lowering pipeline by itself.
 
- 
+## Diagnostics
 
-## End-to-end recipe (anchor example: `all-MiniLM-L6-v2-webnn`)
-1) **Convert with overrides + folding**:
-   - `webnn-graph convert-onnx --input model.onnx --optimize \\
-     --override-dim batch_size=1 \\
-     --override-dim sequence_length=128 \\
-     --output model.webnn --weights model.weights --manifest model.manifest.json`
-2) **Lowering behavior**:
-   - Shape-driving expressions are folded to static constants when possible.
-   - Unresolved symbolic input dimensions can be preserved in v2 input metadata.
-3) **Artifacts**
-   - `model.webnn`: structure-only graph; inputs pinned; consts reference `@weights("…")` or inline tiny
-     scalars; nodes are WebNN ops with sanitized IDs; outputs expose `last_hidden_state`.
-   - `model.weights`: raw little-endian tensor bytes, concatenated.
-   - `model.manifest.json`: dtype/shape/byte offsets for every `@weights` tensor.
+Use the global `--debug` flag before the subcommand to enable converter diagnostics:
+
+```bash
+webnn-graph --debug convert-onnx --input model.onnx --optimize
+```
+
+When conversion fails, first check:
+
+- whether the model uses `ai.onnx` opset 11–18;
+- whether every required symbolic dimension has an override or a usable bounded representation;
+- whether `--optimize` can fold the shape-producing expression;
+- whether the specific operator form and attributes have a registered lowering.
+
+After conversion, parse and validate the artifact independently:
+
+```bash
+webnn-graph parse model.webnn > model.json
+webnn-graph validate model.webnn --weights-manifest model.manifest.json
+```
