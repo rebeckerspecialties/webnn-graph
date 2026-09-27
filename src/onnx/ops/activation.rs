@@ -40,6 +40,10 @@ impl OpHandler for ActivationHandler {
             "unnamed".to_string()
         };
 
+        if op_type == "Gelu" {
+            Self::validate_gelu_approximation(node, &node_name)?;
+        }
+
         // Map ONNX operator to WebNN operation name
         let webnn_op = match op_type {
             "Relu" => "relu",
@@ -68,6 +72,35 @@ impl OpHandler for ActivationHandler {
 }
 
 impl ActivationHandler {
+    fn validate_gelu_approximation(node: &NodeProto, node_name: &str) -> Result<(), OnnxError> {
+        let invalid = |reason: &str| OnnxError::InvalidAttribute {
+            attr: "approximate".to_string(),
+            op: "Gelu".to_string(),
+            node: node_name.to_string(),
+            reason: reason.to_string(),
+        };
+        let mut attributes = node.attribute.iter().filter(|a| a.name == "approximate");
+        let Some(attribute) = attributes.next() else {
+            return Ok(());
+        };
+        if attributes.next().is_some() {
+            return Err(invalid("attribute must not be repeated"));
+        }
+        if attribute.r#type != crate::protos::onnx::attribute_proto::AttributeType::String as i32 {
+            return Err(invalid("expected a string"));
+        }
+        match attribute.s.as_slice() {
+            b"none" => Ok(()),
+            // WebNN gelu is the exact erf-based operation, not ONNX's tanh variant.
+            // Fail closed until a semantics-preserving decomposition is available.
+            b"tanh" => Err(OnnxError::UnsupportedOp {
+                op: "Gelu (approximate=tanh)".to_string(),
+                node: node_name.to_string(),
+            }),
+            _ => Err(invalid("expected 'none' or 'tanh'")),
+        }
+    }
+
     /// Convert ONNX unary/activation operation to WebNN
     fn convert_unary(
         &self,
@@ -215,6 +248,90 @@ mod tests {
         let result = handler.convert(&node, &context).unwrap();
         assert_eq!(result.nodes.len(), 1);
         assert_eq!(result.nodes[0].op, "gelu");
+    }
+
+    fn convert_gelu_attributes(
+        attributes: Vec<crate::protos::onnx::AttributeProto>,
+    ) -> Result<ConversionResult, OnnxError> {
+        let mut node = create_test_node("Gelu", vec!["x"], vec!["y"]);
+        node.attribute = attributes;
+        let initializers = std::collections::HashMap::new();
+        let value_shapes = std::collections::HashMap::new();
+        let const_values = std::collections::HashMap::new();
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
+        ActivationHandler.convert(
+            &node,
+            &ConversionContext {
+                initializers: &initializers,
+                value_shapes: &value_shapes,
+                value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
+                const_values: &const_values,
+                value_ids: &value_ids,
+                value_types: &value_types,
+            },
+        )
+    }
+
+    fn approximate(value: &[u8]) -> crate::protos::onnx::AttributeProto {
+        crate::protos::onnx::AttributeProto {
+            name: "approximate".to_string(),
+            r#type: 3, // AttributeProto::STRING
+            s: value.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_gelu_default_and_none_preserve_exact_operation() {
+        for attributes in [vec![], vec![approximate(b"none")]] {
+            let result = convert_gelu_attributes(attributes).expect("exact GELU");
+            assert_eq!(result.nodes.len(), 1);
+            assert_eq!(result.nodes[0].op, "gelu");
+            assert_eq!(result.nodes[0].inputs, ["x"]);
+            assert!(result.nodes[0].options.is_empty());
+            assert_eq!(result.output_mappings.get("y"), Some(&"y".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_gelu_tanh_is_not_silently_replaced_with_exact_gelu() {
+        let error = convert_gelu_attributes(vec![approximate(b"tanh")])
+            .expect_err("tanh GELU requires a separate lowering");
+        assert!(matches!(error, OnnxError::UnsupportedOp { .. }));
+        let message = error.to_string();
+        assert!(message.contains("Gelu"));
+        assert!(message.contains("tanh"));
+        assert!(message.contains("test_gelu"));
+    }
+
+    #[test]
+    fn test_gelu_rejects_invalid_or_malformed_approximation() {
+        let mut wrong_type = approximate(b"none");
+        wrong_type.r#type = 2; // INT, even if the string field is populated.
+        let mut missing_type = approximate(b"none");
+        missing_type.r#type = 0;
+        for attributes in [
+            vec![approximate(b"invalid")],
+            vec![approximate(b"")],
+            vec![approximate(b"TANH")],
+            vec![approximate(&[0xff])],
+            vec![wrong_type],
+            vec![missing_type],
+            vec![approximate(b"none"), approximate(b"tanh")],
+        ] {
+            let error = convert_gelu_attributes(attributes)
+                .expect_err("invalid approximation must not become exact GELU");
+            assert!(matches!(
+                &error,
+                OnnxError::InvalidAttribute { attr, op, node, .. }
+                    if attr == "approximate" && op == "Gelu" && node == "test_gelu"
+            ));
+            let message = error.to_string();
+            assert!(message.contains("approximate"), "{message}");
+            assert!(message.contains("Gelu"), "{message}");
+            assert!(message.contains("test_gelu"), "{message}");
+        }
     }
 
     #[test]

@@ -33,6 +33,12 @@ operation that requires a static reshape target, axis, permutation, slice bound,
 The exact supported behavior is operator- and opset-specific. Source tests are authoritative; this page does not
 claim that every variant of a named ONNX operator is supported.
 
+The activation handler maps exact GELU (an absent `approximate` attribute or `"none"`) to WebNN `gelu`.
+It rejects `approximate="tanh"` rather than silently changing the activation formula; tanh GELU needs a
+separate decomposition. Invalid approximation attributes also fail conversion. This does not extend the
+opset range: standard-domain ONNX `Gelu` was introduced in opset 20 and remains rejected by the opset guard.
+The older `com.microsoft::Gelu` without approximation attributes remains supported.
+
 ## Constants and output artifacts
 
 By default, `convert-onnx` extracts initializers and large inline constants into a headerless `.weights` blob and

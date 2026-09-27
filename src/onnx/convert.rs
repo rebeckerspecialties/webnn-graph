@@ -33,6 +33,14 @@ pub enum OnnxError {
     #[error("missing required attribute: {attr} in {op}")]
     MissingAttribute { attr: String, op: String },
 
+    #[error("invalid attribute '{attr}' in {op} (node: {node}): {reason}")]
+    InvalidAttribute {
+        attr: String,
+        op: String,
+        node: String,
+        reason: String,
+    },
+
     #[error("invalid tensor shape: {0}")]
     InvalidShape(String),
 
