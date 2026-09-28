@@ -1,10 +1,11 @@
 // Activation and unary math operators: Relu, Gelu, Tanh, Sigmoid, Sqrt, Exp, Log, Abs, Neg, Erf
 
-use crate::ast::Node;
+use crate::ast::{ConstDecl, ConstInit, DataType, Node};
 use crate::onnx::convert::{sanitize_identifier, OnnxError};
 use crate::onnx::ops::{ConversionContext, ConversionResult, OpHandler};
 use crate::protos::onnx::NodeProto;
-use serde_json::Map;
+use serde_json::{json, Map};
+use std::collections::HashSet;
 
 pub struct ActivationHandler;
 
@@ -41,7 +42,35 @@ impl OpHandler for ActivationHandler {
         };
 
         if op_type == "Gelu" {
-            Self::validate_gelu_approximation(node, &node_name)?;
+            if !matches!(node.domain.as_str(), "" | "ai.onnx" | "com.microsoft") {
+                return Err(OnnxError::UnsupportedOp {
+                    op: format!("{}::Gelu", node.domain),
+                    node: node_name,
+                });
+            }
+            if node.input.len() != 1
+                || node.output.len() != 1
+                || node.input[0].is_empty()
+                || node.output[0].is_empty()
+            {
+                return Err(OnnxError::InvalidShape(format!(
+                    "Gelu '{}' expects one input and one output",
+                    node_name
+                )));
+            }
+            if context
+                .value_types
+                .get(&node.input[0])
+                .is_some_and(|dtype| !matches!(dtype, DataType::Float16 | DataType::Float32))
+            {
+                return Err(OnnxError::UnsupportedOp {
+                    op: "Gelu requires float16 or float32 input".to_string(),
+                    node: node_name,
+                });
+            }
+            if Self::gelu_uses_tanh(node, &node_name)? {
+                return self.convert_tanh_gelu(node, &node_name, context);
+            }
         }
 
         // Map ONNX operator to WebNN operation name
@@ -72,7 +101,7 @@ impl OpHandler for ActivationHandler {
 }
 
 impl ActivationHandler {
-    fn validate_gelu_approximation(node: &NodeProto, node_name: &str) -> Result<(), OnnxError> {
+    fn gelu_uses_tanh(node: &NodeProto, node_name: &str) -> Result<bool, OnnxError> {
         let invalid = |reason: &str| OnnxError::InvalidAttribute {
             attr: "approximate".to_string(),
             op: "Gelu".to_string(),
@@ -81,8 +110,11 @@ impl ActivationHandler {
         };
         let mut attributes = node.attribute.iter().filter(|a| a.name == "approximate");
         let Some(attribute) = attributes.next() else {
-            return Ok(());
+            return Ok(false);
         };
+        if node.domain == "com.microsoft" {
+            return Err(invalid("com.microsoft Gelu does not define this attribute"));
+        }
         if attributes.next().is_some() {
             return Err(invalid("attribute must not be repeated"));
         }
@@ -90,15 +122,135 @@ impl ActivationHandler {
             return Err(invalid("expected a string"));
         }
         match attribute.s.as_slice() {
-            b"none" => Ok(()),
-            // WebNN gelu is the exact erf-based operation, not ONNX's tanh variant.
-            // Fail closed until a semantics-preserving decomposition is available.
-            b"tanh" => Err(OnnxError::UnsupportedOp {
-                op: "Gelu (approximate=tanh)".to_string(),
-                node: node_name.to_string(),
-            }),
+            b"none" => Ok(false),
+            b"tanh" => Ok(true),
             _ => Err(invalid("expected 'none' or 'tanh'")),
         }
+    }
+
+    fn convert_tanh_gelu(
+        &self,
+        node: &NodeProto,
+        node_name: &str,
+        context: &ConversionContext,
+    ) -> Result<ConversionResult, OnnxError> {
+        let input = context.resolve_input(&node.input[0]);
+        let output = sanitize_identifier(&node.output[0]);
+        let dtype = context
+            .value_types
+            .get(&node.input[0])
+            .or_else(|| context.value_types.get(&input))
+            .ok_or_else(|| {
+                OnnxError::InvalidShape(format!("Gelu '{}' requires a known input type", node_name))
+            })?;
+        if !matches!(dtype, DataType::Float16 | DataType::Float32) {
+            return Err(OnnxError::UnsupportedOp {
+                op: format!("Gelu with {:?} input", dtype),
+                node: node_name.to_string(),
+            });
+        }
+
+        let mut used: HashSet<String> = context.value_ids.values().cloned().collect();
+        used.insert(input.clone());
+        used.insert(output.clone());
+        let mut private_values = Vec::new();
+        let mut fresh = |suffix: &str| {
+            let base = format!("{}__gelu_{}", output, suffix);
+            let mut id = base.clone();
+            let mut index = 1;
+            while !used.insert(id.clone()) {
+                id = format!("{}_{}", base, index);
+                index += 1;
+            }
+            private_values.push(id.clone());
+            id
+        };
+        let mut result = ConversionResult::default();
+        let x = if *dtype == DataType::Float16 {
+            let id = fresh("float32");
+            result.nodes.push(Node {
+                id: id.clone(),
+                op: "cast".to_string(),
+                inputs: vec![input],
+                options: Map::from_iter([("to".to_string(), json!("float32"))]),
+                outputs: None,
+            });
+            id
+        } else {
+            input
+        };
+
+        // WebNN gelu is erf-based. Preserve ONNX's separate tanh formula using
+        // primitive operations. Promote half inputs for the polynomial and
+        // cancellation near the negative tail, then round only the result.
+        let mut scalar = |suffix: &str, value: f32| {
+            let id = fresh(suffix);
+            result.consts.push((
+                id.clone(),
+                ConstDecl {
+                    data_type: DataType::Float32,
+                    shape: vec![],
+                    init: ConstInit::InlineBytes {
+                        bytes: value.to_le_bytes().to_vec(),
+                    },
+                },
+            ));
+            id
+        };
+        let half = scalar("half", 0.5);
+        let one = scalar("one", 1.0);
+        let coefficient = scalar("coefficient", 0.044715);
+        // Round the mathematical coefficient once, not pi and the division
+        // separately; the latter gives the preceding float32 value.
+        let scale = scalar("scale", (2.0_f64 / std::f64::consts::PI).sqrt() as f32);
+        let mut operation = |suffix: &str, op: &str, inputs: Vec<String>| {
+            let id = fresh(suffix);
+            result.nodes.push(Node {
+                id: id.clone(),
+                op: op.to_string(),
+                inputs,
+                options: Map::new(),
+                outputs: None,
+            });
+            id
+        };
+        let square = operation("square", "mul", vec![x.clone(), x.clone()]);
+        let cube = operation("cube", "mul", vec![square, x.clone()]);
+        let cubic = operation("cubic", "mul", vec![coefficient, cube]);
+        let polynomial = operation("polynomial", "add", vec![x.clone(), cubic]);
+        let scaled = operation("scaled", "mul", vec![scale, polynomial]);
+        let tanh = operation("tanh", "tanh", vec![scaled]);
+        let gate = operation("gate", "add", vec![one, tanh]);
+        let half_x = operation("half_x", "mul", vec![half, x]);
+        let result_id = if *dtype == DataType::Float16 {
+            fresh("result")
+        } else {
+            output.clone()
+        };
+        result.nodes.push(Node {
+            id: result_id.clone(),
+            op: "mul".to_string(),
+            inputs: vec![half_x, gate],
+            options: Map::new(),
+            outputs: None,
+        });
+        if *dtype == DataType::Float16 {
+            result.nodes.push(Node {
+                id: output.clone(),
+                op: "cast".to_string(),
+                inputs: vec![result_id],
+                options: Map::from_iter([("to".to_string(), json!("float16"))]),
+                outputs: None,
+            });
+        }
+        result
+            .output_mappings
+            .insert(node.output[0].clone(), output);
+        result
+            .output_types
+            .insert(node.output[0].clone(), dtype.clone());
+        result.private_values = private_values;
+        Ok(result)
     }
 
     /// Convert ONNX unary/activation operation to WebNN
@@ -259,7 +411,7 @@ mod tests {
         let value_shapes = std::collections::HashMap::new();
         let const_values = std::collections::HashMap::new();
         let value_ids = std::collections::HashMap::new();
-        let value_types = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::from([("x".to_string(), DataType::Float32)]);
         ActivationHandler.convert(
             &node,
             &ConversionContext {
@@ -296,13 +448,10 @@ mod tests {
 
     #[test]
     fn test_gelu_tanh_is_not_silently_replaced_with_exact_gelu() {
-        let error = convert_gelu_attributes(vec![approximate(b"tanh")])
-            .expect_err("tanh GELU requires a separate lowering");
-        assert!(matches!(error, OnnxError::UnsupportedOp { .. }));
-        let message = error.to_string();
-        assert!(message.contains("Gelu"));
-        assert!(message.contains("tanh"));
-        assert!(message.contains("test_gelu"));
+        let result = convert_gelu_attributes(vec![approximate(b"tanh")]).unwrap();
+        assert!(result.nodes.iter().any(|node| node.op == "tanh"));
+        assert!(result.nodes.iter().all(|node| node.op != "gelu"));
+        assert_eq!(result.consts.len(), 4);
     }
 
     #[test]
